@@ -6,13 +6,10 @@ ARG VERSION=EDGE
 ARG RELEASE=0
 
 # These ARGs are for caching stage builds in CI
-# Leave them as is when building locally
 ARG LOAD_WHISPER_STAGE=load_whisper
 ARG NO_MODEL_STAGE=no_model
 
-# When downloading diarization model with auth token, it seems that it is not respecting the TORCH_HOME env variable.
-# So it is necessary to ensure that the CACHE_HOME is set to the exact same path as the default path.
-# https://github.com/jim60105/docker-whisperX/issues/27
+# Cache home settings
 ARG CACHE_HOME=/.cache
 ARG CONFIG_HOME=/.config
 ARG TORCH_HOME=${CACHE_HOME}/torch
@@ -23,9 +20,9 @@ ARG HF_HOME=${CACHE_HOME}/huggingface
 ########################################
 FROM python:3.11-slim AS base
 
-# RUN mount cache for multi-arch: https://github.com/docker/buildx/issues/549#issuecomment-1788297892
 ARG TARGETARCH
 ARG TARGETVARIANT
+ARG TARGETPLATFORM
 
 # Install CUDA and dependencies
 RUN --mount=type=cache,id=apt-$TARGETARCH$TARGETVARIANT,sharing=locked,target=/var/cache/apt \
@@ -39,11 +36,16 @@ RUN --mount=type=cache,id=apt-$TARGETARCH$TARGETVARIANT,sharing=locked,target=/v
 ########################################
 FROM base AS build
 
-# RUN mount cache for multi-arch: https://github.com/docker/buildx/issues/549#issuecomment-1788297892
 ARG TARGETARCH
 ARG TARGETVARIANT
 
 WORKDIR /app
+
+# Copy required files for installation
+COPY requirements.txt /app/
+COPY setup.py /app/
+COPY MANIFEST.in /app/
+COPY whisperX /app/whisperX/
 
 # Install under /root/.local
 ARG PIP_USER="true"
@@ -58,18 +60,15 @@ RUN --mount=type=cache,id=pip-$TARGETARCH$TARGETVARIANT,sharing=locked,target=/r
     pip install -U --extra-index-url https://download.pytorch.org/whl/cu120 \
     torch==2.1.2 torchaudio==2.1.2 \
     pyannote.audio==3.1.1 \
-    # https://github.com/jim60105/docker-whisperX/issues/40
     "numpy<2.0"
 
+# Install requirements.txt
 RUN --mount=type=cache,id=pip-$TARGETARCH$TARGETVARIANT,sharing=locked,target=/root/.cache/pip \
-    --mount=source=whisperX/requirements.txt,target=requirements.txt \
     pip install -r requirements.txt
 
-# Install whisperX
+# Install whisperX with explicit PYTHONPATH
 RUN --mount=type=cache,id=pip-$TARGETARCH$TARGETVARIANT,sharing=locked,target=/root/.cache/pip \
-    --mount=source=whisperX,target=.,rw \
-    pip install . && \
-    # Cleanup
+    PYTHONPATH=/app pip install -e . && \
     find "/root/.local" -name '*.pyc' -print0 | xargs -0 rm -f || true ; \
     find "/root/.local" -type d -name '__pycache__' -print0 | xargs -0 rm -rf || true ;
 
@@ -102,19 +101,15 @@ RUN install -d -m 775 -o $UID -g 0 /licenses && \
     install -d -m 775 -o $UID -g 0 ${CACHE_HOME} && \
     install -d -m 775 -o $UID -g 0 ${CONFIG_HOME}
 
-# ffmpeg
+# Copy ffmpeg and dumb-init
 COPY --link --from=ghcr.io/jim60105/static-ffmpeg-upx:7.0-1 /ffmpeg /usr/local/bin/
-# COPY --link --from=ghcr.io/jim60105/static-ffmpeg-upx:7.0-1 /ffprobe /usr/local/bin/
-
-# dumb-init
 COPY --link --from=ghcr.io/jim60105/static-ffmpeg-upx:7.0-1 /dumb-init /usr/local/bin/
 
-# Copy licenses (OpenShift Policy)
+# Copy licenses with corrected paths
 COPY --link --chown=$UID:0 --chmod=775 LICENSE /licenses/LICENSE
-COPY --link --chown=$UID:0 --chmod=775 whisperX/LICENSE /licenses/whisperX.LICENSE
+COPY --link --chown=$UID:0 --chmod=775 whisperX.LICENSE /licenses/whisperX.LICENSE
 
-# Copy dependencies and code (and support arbitrary uid for OpenShift best practice)
-# https://docs.openshift.com/container-platform/4.14/openshift_images/create-images.html#use-uid_create-images
+# Copy dependencies and code
 COPY --link --chown=$UID:0 --chmod=775 --from=build /root/.local /home/$UID/.local
 
 ENV PATH="/home/$UID/.local/bin:$PATH"
@@ -135,25 +130,8 @@ STOPSIGNAL SIGINT
 
 ENTRYPOINT [ "dumb-init", "--", "/bin/sh", "-c", "whisperx \"$@\"" ]
 
-ARG VERSION
-ARG RELEASE
-LABEL name="jim60105/docker-whisperX" \
-    # Authors for WhisperX
-    vendor="Bain, Max and Huh, Jaesung and Han, Tengda and Zisserman, Andrew" \
-    # Maintainer for this docker image
-    maintainer="jim60105" \
-    # Dockerfile source repository
-    url="https://github.com/jim60105/docker-whisperX" \
-    version=${VERSION} \
-    # This should be a number, incremented with each change
-    release=${RELEASE} \
-    io.k8s.display-name="WhisperX" \
-    summary="WhisperX: Time-Accurate Speech Transcription of Long-Form Audio" \
-    description="This is the docker image for WhisperX: Automatic Speech Recognition with Word-Level Timestamps (and Speaker Diarization) from the community. For more information about this tool, please visit the following website: https://github.com/m-bain/whisperX."
-
 ########################################
 # load_whisper stage
-# This stage will be tagged for caching in CI.
 ########################################
 FROM ${NO_MODEL_STAGE} AS load_whisper
 
@@ -175,11 +153,10 @@ FROM ${LOAD_WHISPER_STAGE} AS load_align
 ARG TORCH_HOME
 ARG HF_HOME
 
-# Preload align models
+# Copy and run alignment model loader
+COPY --chown=$UID:0 --chmod=775 load_align_model.py /app/load_align_model.py
 ARG LANG
-
-RUN --mount=source=load_align_model.py,target=load_align_model.py \
-    for i in ${LANG}; do echo "Aliging lang $i"; python3 load_align_model.py "$i"; done
+RUN for i in ${LANG}; do echo "Aligning lang $i"; python3 /app/load_align_model.py "$i"; done
 
 ########################################
 # Final stage with model
@@ -187,8 +164,8 @@ RUN --mount=source=load_align_model.py,target=load_align_model.py \
 FROM ${NO_MODEL_STAGE} AS final
 
 ARG UID
-
 ARG CACHE_HOME
+
 COPY --link --chown=$UID:0 --chmod=775 --from=load_align ${CACHE_HOME} ${CACHE_HOME}
 
 ARG WHISPER_MODEL
@@ -196,10 +173,13 @@ ENV WHISPER_MODEL=${WHISPER_MODEL}
 ARG LANG
 ENV LANG=${LANG}
 
-# Take the first language from LANG env variable
 ENTRYPOINT [ "dumb-init", "--", "/bin/sh", "-c", "LANG=$(echo ${LANG} | cut -d ' ' -f1); whisperx --model \"${WHISPER_MODEL}\" --language \"${LANG}\" \"$@\"" ]
 
 ARG VERSION
 ARG RELEASE
-LABEL version=${VERSION} \
-    release=${RELEASE}
+LABEL name="whisperX" \
+    vendor="Bain, Max and Huh, Jaesung and Han, Tengda and Zisserman, Andrew" \
+    version=${VERSION} \
+    release=${RELEASE} \
+    summary="WhisperX: Time-Accurate Speech Transcription of Long-Form Audio" \
+    description="Automatic Speech Recognition with Word-Level Timestamps (and Speaker Diarization)"
