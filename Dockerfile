@@ -27,9 +27,16 @@ ARG TARGETPLATFORM
 # Install CUDA and dependencies
 RUN --mount=type=cache,id=apt-$TARGETARCH$TARGETVARIANT,sharing=locked,target=/var/cache/apt \
     --mount=type=cache,id=aptlists-$TARGETARCH$TARGETVARIANT,sharing=locked,target=/var/lib/apt/lists \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && \
+    apt-get install -y --no-install-recommends wget gnupg2 && \
+    wget https://developer.download.nvidia.com/compute/cuda/repos/debian11/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
     cuda-toolkit-12-0 libcudnn8 \
-    $([ "$TARGETPLATFORM" = "linux/arm64" ] && echo "libgomp1=12.2.0-14 libsndfile1=1.2.0-1")
+    $([ "$TARGETPLATFORM" = "linux/arm64" ] && echo "libgomp1=12.2.0-14 libsndfile1=1.2.0-1") && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -f cuda-keyring_1.1-1_all.deb
 
 ########################################
 # Build stage
